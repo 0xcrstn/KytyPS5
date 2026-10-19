@@ -3761,6 +3761,36 @@ private:
 		return static_cast<uint32_t>(m_info.buffers.size() - 1);
 	}
 
+	// Bytes a write can reach relative to the descriptor base, when its index, VGPR offset and
+	// SGPR offset are constants. CalculateBufferAddress adds index * stride, so only index 0 is
+	// independent of the descriptor; formatted stores convert to a runtime format. The backend
+	// accesses whole 4-byte words (8-byte for 64-bit atomics) at the address rounded down, so a
+	// write may reach up to one element minus one byte beyond the requested bytes.
+	static void RecordWrittenRange(BufferResource& resource, const Inst& inst,
+	                               const MemoryInfo& memory, ValueOpcode op) {
+		const uint32_t element  = TypeOf(op) == Type::U64 ? 8u : 4u;
+		resource.written_slack  = std::max(resource.written_slack, element - 1u);
+		const auto constant_u32 = [](Value value) {
+			return value.IsImmediate() && value.GetType() == Type::U32;
+		};
+		const auto index   = inst.Arg(1).Resolve();
+		const auto offset  = inst.Arg(2).Resolve();
+		const auto soffset = inst.Arg(3).Resolve();
+		if (memory.formatted || !constant_u32(index) || index.U32() != 0u ||
+		    !constant_u32(offset) || !constant_u32(soffset)) {
+			resource.written_dynamic = true;
+			return;
+		}
+		const uint64_t begin = uint64_t {offset.U32()} + soffset.U32() + memory.offset;
+		const uint64_t end   = begin + (ByteExtent(memory) - memory.offset);
+		if (end > UINT32_MAX) {
+			resource.written_dynamic = true;
+			return;
+		}
+		resource.written_begin = std::min(resource.written_begin, static_cast<uint32_t>(begin));
+		resource.written_end   = std::max(resource.written_end, static_cast<uint32_t>(end));
+	}
+
 	static void Merge(BufferResource& resource, const MemoryInfo& memory, ValueOpcode op,
 	                  uint32_t pc) {
 		const auto access        = BufferAccessOf(op);
@@ -3942,6 +3972,9 @@ private:
 			resource = AddBuffer(source, memory, op, flags.pc);
 			if (resource == UINT32_MAX) {
 				Fail(flags.pc, "buffer resource limit exceeded");
+			}
+			if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic) {
+				RecordWrittenRange(m_info.buffers[resource], inst, memory, op);
 			}
 			AddHandlePatch(handle, resource, flags.pc);
 			AddMemoryPatch(flags.index, resource, 0, false, flags.pc);

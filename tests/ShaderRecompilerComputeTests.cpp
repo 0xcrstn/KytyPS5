@@ -1896,6 +1896,140 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
           std::move(resources), std::move(packed_user_data)};
 }
 
+void CheckBufferWrittenRanges() {
+  constexpr const char *name = "BufferWrittenRanges";
+  const auto written_buffer = [&](const CompiledShader &compiled) {
+    const auto &buffers = compiled.program.info.buffers;
+    const auto it = std::find_if(buffers.begin(), buffers.end(),
+                                 [](const auto &buffer) { return buffer.written; });
+    Require(name, "written buffer", it != buffers.end(), "the shader must write a buffer");
+    return *it;
+  };
+
+  TestCase constant{};
+  constant.name = name;
+  constant.initial.assign(16, 0);
+  AppendVMovU32(&constant.code, 1, 0);
+  AppendVMovU32(&constant.code, 2, 1);
+  constant.code.push_back(EncodeMubuf0(0x32, 0x24, false, false));
+  constant.code.push_back(EncodeMubuf1(2, 0, 1));
+  constant.code.push_back(EncodeMubuf0(0x1c, 0x28, false, false));
+  constant.code.push_back(EncodeMubuf1(2, 0, 1));
+  constant.code.push_back(EncodeMubuf0(0x32, 0x2c, false, false));
+  constant.code.push_back(EncodeMubuf1(2, 0, 1));
+  AppendEnd(&constant.code);
+  const auto constant_buffer = written_buffer(CompileCase(constant));
+  Require(name, "constant write range",
+          !constant_buffer.written_dynamic && constant_buffer.written_begin == 0x24u &&
+              constant_buffer.written_end == 0x30u && constant_buffer.written_slack == 3u,
+          "constant-offset stores and atomics must record bytes 0x24-0x30, got " +
+              std::to_string(constant_buffer.written_begin) + "-" +
+              std::to_string(constant_buffer.written_end) +
+              (constant_buffer.written_dynamic ? " (dynamic)" : ""));
+
+  TestCase atomic64{};
+  atomic64.name = name;
+  atomic64.initial.assign(16, 0);
+  AppendVMovU32(&atomic64.code, 2, 1);
+  AppendVMovU32(&atomic64.code, 3, 0);
+  atomic64.code.push_back(EncodeMubuf0(0x52, 0x4, false, false));
+  atomic64.code.push_back(EncodeMubuf1(2, 0, 1));
+  AppendEnd(&atomic64.code);
+  const auto atomic64_buffer = written_buffer(CompileCase(atomic64));
+  Require(name, "64-bit atomic range",
+          !atomic64_buffer.written_dynamic && atomic64_buffer.written_begin == 0x4u &&
+              atomic64_buffer.written_end == 0xcu && atomic64_buffer.written_slack == 7u,
+          "a 64-bit atomic at offset 4 must record bytes 4-12 with 7 bytes of slack");
+
+  TestCase dynamic{};
+  dynamic.name = name;
+  dynamic.initial.assign(16, 0);
+  dynamic.has_compute_info = true;
+  dynamic.compute_info.wave_size = 64;
+  dynamic.compute_info.threads_num[0] = 64;
+  dynamic.compute_info.threads_num[1] = dynamic.compute_info.threads_num[2] = 1u;
+  dynamic.compute_info.thread_ids_num = 1u;
+  AppendVMovU32(&dynamic.code, 2, 1);
+  dynamic.code.push_back(EncodeMubuf0(0x1c, 0x28, false, true));
+  dynamic.code.push_back(EncodeMubuf1(2, 0, 0));
+  AppendEnd(&dynamic.code);
+  const auto dynamic_buffer = written_buffer(CompileCase(dynamic));
+  Require(name, "register offset", dynamic_buffer.written_dynamic,
+          "a store with a VGPR offset must leave the written range unknown, got " +
+              std::to_string(dynamic_buffer.written_begin) + "-" +
+              std::to_string(dynamic_buffer.written_end));
+
+  ShaderRecompiler::IR::BufferResource resource{};
+  resource.written = true;
+  resource.written_begin = 0x24;
+  resource.written_end = 0x30;
+  resource.written_slack = 3;
+  ShaderBufferResource descriptor{};
+  descriptor.fields[0] = 0xeb002e00u;
+  descriptor.fields[1] = 0x00380012u;
+  descriptor.fields[2] = 0x00000001u;
+  descriptor.fields[3] = 0x00016204u;
+  const PreparedBindings::BufferSource bound{0x12eb002e00ull, 0x38u, {}};
+  const auto narrowed = ShaderBufferWrittenRange(resource, descriptor, bound);
+  Require(name, "narrowed range",
+          narrowed.address == 0x12eb002e21ull && narrowed.size == 0x12u,
+          "a constant write range must narrow the bound range to its own bytes");
+  Require(name, "disjoint read",
+          !(0x12eb002e34ull < narrowed.address + narrowed.size &&
+            narrowed.address < 0x12eb002e34ull + 4u),
+          "the read at +0x34 must not overlap writes at +0x24..+0x30");
+  auto aligned_atomic = resource;
+  aligned_atomic.written_begin = 0x4;
+  aligned_atomic.written_end = 0xc;
+  aligned_atomic.written_slack = 7;
+  const auto atomic_range = ShaderBufferWrittenRange(aligned_atomic, descriptor, bound);
+  Require(name, "64-bit atomic alignment",
+          atomic_range.address <= bound.address &&
+              bound.address + 4u <= atomic_range.address + atomic_range.size,
+          "a 64-bit atomic at offset 4 rounds down to offset 0 and must overlap a read there");
+  const auto require_full = [&](const char *stage,
+                                const ShaderRecompiler::IR::BufferResource &tested,
+                                const ShaderBufferResource &tested_descriptor) {
+    const auto range = ShaderBufferWrittenRange(tested, tested_descriptor, bound);
+    Require(name, stage, range.address == bound.address && range.size == bound.size,
+            "the written range must stay the whole bound range");
+  };
+  auto add_tid = descriptor;
+  add_tid.fields[3] |= 1u << 23u;
+  require_full("ADD_TID", resource, add_tid);
+  auto swizzled = descriptor;
+  swizzled.fields[1] |= 1u << 31u;
+  require_full("swizzle", resource, swizzled);
+  auto unknown = resource;
+  unknown.written_dynamic = true;
+  require_full("dynamic", unknown, descriptor);
+  auto past_end = resource;
+  past_end.written_end = 0x40;
+  require_full("past bound end", past_end, descriptor);
+  ShaderRecompiler::IR::CompiledShaderInfo wiring_program{};
+  auto &unwritten = wiring_program.info.buffers.emplace_back();
+  unwritten.read = true;
+  unwritten.descriptor_index = 1;
+  auto &struct_buffer = wiring_program.info.buffers.emplace_back(resource);
+  struct_buffer.descriptor_index = 0;
+  ShaderRecompiler::IR::ResourceSnapshot wiring_snapshot;
+  for (const auto *fields : {&add_tid, &descriptor}) {
+    auto &value = wiring_snapshot.buffers.emplace_back();
+    std::memcpy(value.dwords.data(), fields->fields, sizeof(fields->fields));
+    value.dword_count = 4;
+  }
+  ShaderStageRuntime wiring_runtime{&wiring_program, &wiring_snapshot};
+  PreparedBindings wiring_bindings;
+  wiring_bindings.runtime = &wiring_runtime;
+  wiring_bindings.buffer_sources = {bound, {0x1000u, 0x40u, {}}};
+  std::vector<PreparedBindings::BufferSource> writes;
+  AppendShaderBufferWrites(wiring_bindings, writes);
+  Require(name, "gathered writes",
+          writes.size() == 1 && writes[0].address == narrowed.address &&
+              writes[0].size == narrowed.size,
+          "only the written buffer must be gathered, narrowed with its own descriptor");
+}
+
 std::array<u32, 64> MakeSampledTextureData(Prospero::BufferFormat format) {
   return MakeStorageTextureData(format);
 }
@@ -49242,6 +49376,10 @@ int main(int argc, char **argv) {
     RunGraphicsCase(&vulkan, GraphicsPerspectiveSample(true));
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-write-range-only") == 0) {
+    CheckBufferWrittenRanges();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--pixel-alias-only") == 0) {
     CheckPixelParameterAliases();
     CheckRectListShaders();
@@ -49867,6 +50005,7 @@ int main(int argc, char **argv) {
   CheckEmbeddedFetchLaneSpill();
   CheckTessellationPrograms();
   CheckPixelParameterAliases();
+  CheckBufferWrittenRanges();
   CheckPixelFrontFaceModes();
   CheckRectListShaders();
   CheckSigned16ImageStore(vulkan);

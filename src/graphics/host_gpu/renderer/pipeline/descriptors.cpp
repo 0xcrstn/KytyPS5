@@ -75,6 +75,38 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 	EXIT("invalid native descriptor binding kind");
 }
 
+PreparedBindings::BufferSource
+ShaderBufferWrittenRange(const ShaderRecompiler::IR::BufferResource& resource,
+                         const ShaderBufferResource&                 descriptor,
+                         const PreparedBindings::BufferSource&       bound) {
+	// ADD_TID adds the lane to the index and swizzling reorders bytes, so a constant offset
+	// then no longer names the bytes written.
+	const uint64_t slack = resource.written_slack;
+	if (resource.written_dynamic || resource.written_begin >= resource.written_end ||
+	    descriptor.AddTid() || descriptor.SwizzleEnabled() ||
+	    resource.written_end + slack > bound.size || bound.address < slack) {
+		return bound;
+	}
+	return {bound.address + resource.written_begin - slack,
+	        uint64_t {resource.written_end} - resource.written_begin + 2u * slack, bound.id};
+}
+
+void AppendShaderBufferWrites(const PreparedBindings&                      prepared,
+                              std::vector<PreparedBindings::BufferSource>& writes) {
+	const auto& program  = *prepared.runtime->program;
+	const auto& snapshot = *prepared.runtime->resources;
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		const auto& resource = program.info.buffers[i];
+		if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
+		const auto written = ShaderBufferWrittenRange(
+		    resource, DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]),
+		    prepared.buffer_sources[resource.descriptor_index]);
+		if (written.size != 0) {
+			writes.push_back(written);
+		}
+	}
+}
+
 vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture, uint32_t element) {
 	if (!texture.image_id) {
 		EXIT_IF(texture.image_view != nullptr || !texture.mip_views.empty());
@@ -930,6 +962,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
+	m_buffer_writes.clear();
+	bool buffer_writes_gathered = false;
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
@@ -937,6 +971,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			if (writer->runtime->program->has_address_writes) {
 				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
 			}
+		}
+		if (!buffer_writes_gathered) {
+			for (const auto* writer: prepared_bindings) {
+				AppendShaderBufferWrites(*writer, m_buffer_writes);
+			}
+			buffer_writes_gathered = true;
 		}
 		for (const auto [address, size]: reads) {
 			for (const auto id: m_bound_images) {
@@ -951,15 +991,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					}
 				}
 			}
-			for (const auto* writer: prepared_bindings) {
-				const auto& program = *writer->runtime->program;
-				for (const auto& resource: program.info.buffers) {
-					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
-					const auto& written = writer->buffer_sources[resource.descriptor_index];
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
-					}
+			for (const auto& written: m_buffer_writes) {
+				if (ImageRangeOverlaps(address, size, written.address, written.size)) {
+					EXIT("scalar resource reads overlap a shader buffer write\n");
 				}
 			}
 		}

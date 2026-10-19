@@ -213,6 +213,7 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	std::vector<PreparedBindings::BufferSource> m_buffer_writes;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

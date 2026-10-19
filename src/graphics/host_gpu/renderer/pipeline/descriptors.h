@@ -52,6 +52,12 @@ struct PreparedBindings {
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);
 [[nodiscard]] vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture,
                                                     uint32_t              element = 0);
+[[nodiscard]] PreparedBindings::BufferSource
+ShaderBufferWrittenRange(const ShaderRecompiler::IR::BufferResource& resource,
+                         const ShaderBufferResource&                 descriptor,
+                         const PreparedBindings::BufferSource&       bound);
+void AppendShaderBufferWrites(const PreparedBindings&                      prepared,
+                              std::vector<PreparedBindings::BufferSource>& writes);
 
 template <typename T>
 [[nodiscard]] T DecodeNativeDescriptor(const ShaderRecompiler::IR::DescriptorValue& value) {
