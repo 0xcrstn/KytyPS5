@@ -95,6 +95,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -1390,6 +1391,7 @@ struct GraphicsCase {
   float vertex_clip_w = 1.0f;
   bool pixel_depth_export = false;
   u32 pixel_perspective_sample_vgpr = UINT32_MAX;
+  u32 pixel_lds_size_dwords = 0;
   u32 pixel_perspective_centroid_vgpr = UINT32_MAX;
   u32 pixel_custom_interpolation_mask = 0;
   u32 width = 1;
@@ -1850,6 +1852,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   pixel_info.ps_perspective_centroid_vgpr = test.pixel_perspective_centroid_vgpr;
   pixel_info.custom_interpolation_mask = test.pixel_custom_interpolation_mask;
   pixel_info.object_primitive_id = !test.object_ids.empty();
+  pixel_info.lds_size_dwords = test.pixel_lds_size_dwords;
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
     pixel_info.interpolator_settings[i] = i;
   }
@@ -1894,6 +1897,104 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   packed_user_data.resize(result.program.bindings.ShaderDataDwords());
   return {std::move(result.spirv), std::move(result.program),
           std::move(resources), std::move(packed_user_data)};
+}
+
+std::vector<u32> FunctionArrayLengths(const std::vector<u32> &spirv) {
+  std::unordered_map<u32, u32> constants;
+  std::unordered_map<u32, u32> array_lengths;
+  std::unordered_map<u32, u32> function_pointees;
+  std::vector<u32> lengths;
+  for (size_t offset = 5; offset < spirv.size();) {
+    const u32 word_count = spirv[offset] >> 16u;
+    const auto opcode = static_cast<spv::Op>(spirv[offset] & 0xffffu);
+    const u32 *words = spirv.data() + offset;
+    if (opcode == spv::OpConstant && word_count == 4) {
+      constants[words[2]] = words[3];
+    } else if (opcode == spv::OpTypeArray) {
+      array_lengths[words[1]] = words[3];
+    } else if (opcode == spv::OpTypePointer && words[2] == spv::StorageClassFunction) {
+      function_pointees[words[1]] = words[3];
+    } else if (opcode == spv::OpVariable && words[3] == spv::StorageClassFunction) {
+      const auto pointee = function_pointees.find(words[1]);
+      if (pointee != function_pointees.end()) {
+        const auto array = array_lengths.find(pointee->second);
+        if (array != array_lengths.end()) {
+          lengths.push_back(constants.at(array->second));
+        }
+      }
+    }
+    offset += word_count;
+  }
+  return lengths;
+}
+
+std::vector<u32> LdsReadWriteCode(u32 export_target) {
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovLiteral(&code, 2, 0x3f800000u);
+  code.push_back(EncodeDs0(0x0d, 0));
+  code.push_back(EncodeDs1(0, 2, 1));
+  code.push_back(EncodeDs0(0x36, 0));
+  code.push_back(EncodeDs1(3, 0, 1));
+  code.push_back(EncodeExp0(export_target, 0xf));
+  code.push_back(EncodeExp1(3, 3, 3, 3));
+  AppendEnd(&code);
+  return code;
+}
+
+void CheckFunctionLdsAllocation() {
+  constexpr const char *name = "FunctionLdsAllocation";
+  constexpr std::array<std::pair<u32, u32>, 4> sizes{
+      {{256u, 256u}, {0u, 8192u}, {8192u, 8192u}, {255u * 128u, 8192u}}};
+  const auto require_array = [&](const char *stage, const std::vector<u32> &spirv,
+                                 u32 expected) {
+    const auto lengths = FunctionArrayLengths(spirv);
+    const auto has = [&](u32 length) {
+      return std::find(lengths.begin(), lengths.end(), length) != lengths.end();
+    };
+    Require(name, stage, has(expected) && (expected == 8192u || !has(8192u)),
+            "function-scope LDS must be declared with " + std::to_string(expected) +
+                " dwords");
+  };
+  for (const auto &[guest, expected] : sizes) {
+    GraphicsCase test{};
+    test.name = name;
+    test.pixel_lds_size_dwords = guest;
+    test.fragment_code = LdsReadWriteCode(0x00);
+    const auto pixel = CompileFragmentCase(test);
+    Require(name, "pixel function LDS", pixel.program.info.function_lds,
+            "a pixel shader with DS reads and writes must use function-scope LDS");
+    require_array("pixel LDS array length", pixel.spirv, expected);
+
+    ShaderVertexInputInfo vertex{};
+    vertex.lds_size_dwords = guest;
+    ShaderRecompiler::CompileOptions options;
+    options.stage = ShaderType::Vertex;
+    options.input_info.vertex = &vertex;
+    auto translated = ShaderRecompiler::TranslateProgram(LdsReadWriteCode(0x0c), options);
+    auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, {});
+    ValidateSpirv(name, compiled.spirv);
+    Require(name, "vertex function LDS", compiled.program.info.function_lds,
+            "a vertex shader with DS reads and writes must use function-scope LDS");
+    require_array("vertex LDS array length", compiled.spirv, expected);
+
+    for (const auto stage : {ShaderType::Local, ShaderType::TessellationControl,
+                             ShaderType::TessellationEvaluation}) {
+      ShaderVertexInputInfo tess_stage{};
+      tess_stage.logical_stage = stage;
+      tess_stage.lds_size_dwords = guest;
+      ShaderStageInputInfo input{};
+      input.vertex = &tess_stage;
+      Require(name, "tessellation stage LDS size", ShaderStageLdsDwords(stage, input) == expected,
+              "local, hull and domain stages must use the clamped guest LDS allocation");
+    }
+  }
+  ShaderComputeInputInfo compute{};
+  compute.lds_size_dwords = 0;
+  ShaderStageInputInfo compute_input{};
+  compute_input.compute = &compute;
+  Require(name, "compute LDS size", ShaderStageLdsDwords(ShaderType::Compute, compute_input) == 0,
+          "workgroup LDS must keep the guest size without the function-scope fallback");
 }
 
 std::array<u32, 64> MakeSampledTextureData(Prospero::BufferFormat format) {
@@ -49242,6 +49343,10 @@ int main(int argc, char **argv) {
     RunGraphicsCase(&vulkan, GraphicsPerspectiveSample(true));
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--function-lds-only") == 0) {
+    CheckFunctionLdsAllocation();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--pixel-alias-only") == 0) {
     CheckPixelParameterAliases();
     CheckRectListShaders();
@@ -49867,6 +49972,7 @@ int main(int argc, char **argv) {
   CheckEmbeddedFetchLaneSpill();
   CheckTessellationPrograms();
   CheckPixelParameterAliases();
+  CheckFunctionLdsAllocation();
   CheckPixelFrontFaceModes();
   CheckRectListShaders();
   CheckSigned16ImageStore(vulkan);

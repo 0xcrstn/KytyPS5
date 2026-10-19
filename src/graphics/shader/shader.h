@@ -7,6 +7,7 @@
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <algorithm>
 #include <array>
 #include <span>
 #include <string>
@@ -149,6 +150,7 @@ struct ShaderVertexInputInfo {
 	int                     buffers_num         = 0;
 	uint32_t                wave_size           = 64;
 	uint32_t                scratch_size_dwords = 0;
+	uint32_t                lds_size_dwords     = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;
 	ShaderClipSpaceTransform clip_space;
 	ShaderMeshInputInfo      mesh;
@@ -191,6 +193,7 @@ struct ShaderPixelInputInfo {
 	// CB round mode per converted export: zero adds half an LSB, one truncates.
 	uint8_t                                        target_round_mode            = 0;
 	uint32_t                                       scratch_size_dwords          = 0;
+	uint32_t                                       lds_size_dwords              = 0;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;
 	bool                                           ps_pos_z                     = false;
@@ -228,6 +231,29 @@ inline const ShaderWorkgroupInputInfo* ShaderWorkgroupInput(ShaderType          
 		case ShaderType::Mesh: return &input.vertex->mesh;
 		default: return nullptr;
 	}
+}
+
+inline constexpr uint32_t SHADER_FUNCTION_LDS_MAX_DWORDS = 8192;
+
+inline uint32_t ShaderStageLdsDwords(ShaderType stage, ShaderStageInputInfo input) {
+	if (const auto* workgroup = ShaderWorkgroupInput(stage, input); workgroup != nullptr) {
+		return workgroup->lds_size_dwords;
+	}
+	uint32_t guest_dwords = 0;
+	switch (stage) {
+		case ShaderType::Pixel:
+			guest_dwords = input.pixel != nullptr ? input.pixel->lds_size_dwords : 0u;
+			break;
+		case ShaderType::Vertex:
+		case ShaderType::Local:
+		case ShaderType::TessellationControl:
+		case ShaderType::TessellationEvaluation:
+			guest_dwords = input.vertex != nullptr ? input.vertex->lds_size_dwords : 0u;
+			break;
+		default: break;
+	}
+	return guest_dwords == 0 ? SHADER_FUNCTION_LDS_MAX_DWORDS
+	                         : std::min(guest_dwords, SHADER_FUNCTION_LDS_MAX_DWORDS);
 }
 
 uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, uint32_t input);
