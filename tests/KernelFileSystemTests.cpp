@@ -135,6 +135,34 @@ void *KYTY_SYSV_ABI RunMutexWaiter(void *arg) {
   return nullptr;
 }
 
+void *KYTY_SYSV_ABI ReturnFromGuestThread(void *) { return nullptr; }
+
+// EA SPORTS UFC 6 (PPSA23566) reads a thread's priority while another thread joins it. Kyty
+// probed the native handle, which pthread_join releases, and winpthreads then read NULL+0xbc.
+void TestGetprioAfterJoin() {
+  using namespace Libs::LibKernel;
+  std::vector<uint8_t> stack(1024 * 1024);
+  PthreadAttr attr = nullptr;
+  Pthread thread = nullptr;
+  Check(PthreadAttrInit(&attr) == OK &&
+            PthreadAttrSetstack(&attr, stack.data(), stack.size()) == OK &&
+            PthreadCreate(&thread, &attr, ReturnFromGuestThread, nullptr, "GetprioJoin") == OK,
+        "create guest thread for getprio");
+  // sched_param is { int sched_priority; }; its header clashes with this file's includes.
+  int guest_priority[4] = {-1, 0, 0, 0};
+  Check(PthreadAttrGetschedparam(&attr, reinterpret_cast<KernelSchedParam *>(guest_priority)) ==
+                OK &&
+            PthreadAttrDestroy(&attr) == OK,
+        "read the created thread's priority");
+  int prio = -1;
+  Check(PthreadGetprio(thread, &prio) == OK && prio == guest_priority[0],
+        "getprio before the join reports the guest priority");
+  Check(PthreadJoin(thread, nullptr) == OK, "join guest thread for getprio");
+  prio = -1;
+  Check(PthreadGetprio(thread, &prio) == KERNEL_ERROR_ESRCH && prio == -1,
+        "getprio on a joined thread reports ESRCH without touching the released handle");
+}
+
 void QueueMutexWaiter(MutexWaiter &waiter) {
   using namespace Libs::LibKernel;
   PthreadAttr attr = nullptr;
@@ -2414,7 +2442,17 @@ int main(int argc, char** argv) {
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
 
+  if (argc == 2 && std::string_view(argv[1]) == "--getprio-only") {
+    Common::Singleton<Loader::RuntimeLinker>::Instance();
+    Libs::LibKernel::Initialize();
+    Libs::LibKernel::PthreadInitSelfForMainThread();
+    TestGetprioAfterJoin();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: getprio cases passed\n");
+    return 0;
+  }
   TestMutexHandoff();
+  TestGetprioAfterJoin();
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
     subsystems.Destroy();
     std::printf("KernelFileSystemTests: mutex cases passed\n");
