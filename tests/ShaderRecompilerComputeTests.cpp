@@ -2383,6 +2383,82 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // UFC 6 (PPSA23566) compute shader 0x940345cace0f5304 stores and atomics at
+  // +0x24..+0x30 of the buffer whose +0x34 dword it reads as a scalar constant.
+  void CommitScalarReadAfterBufferWrite(uint64_t read_offset) {
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+
+    ShaderRecompiler::IR::CompiledShaderInfo program{};
+    program.stage = ShaderType::Compute;
+    auto &resource = program.info.buffers.emplace_back();
+    resource.written = true;
+    resource.written_begin = 0x24;
+    resource.written_end = 0x30;
+    resource.written_slack = 3;
+    resource.descriptor_index = 0;
+    ShaderRecompiler::IR::ResourceSnapshot snapshot;
+    auto &value = snapshot.buffers.emplace_back();
+    value.dwords[0] = 0xeb002e00u;
+    value.dwords[1] = 0x00380012u;
+    value.dwords[2] = 0x00000001u;
+    value.dwords[3] = 0x00016204u;
+    value.dword_count = 4;
+    constexpr uint64_t address = 0x12eb002e00ull;
+    snapshot.specialization_reads = {{address + read_offset, 4u}};
+    ShaderStageRuntime runtime{&program, &snapshot};
+    PreparedBindings prepared;
+    prepared.runtime = &runtime;
+    prepared.buffer_sources = {{address, 0x38u, {}}};
+    prepared.shader_data.resize(program.bindings.ShaderDataDwords());
+
+    const auto pipeline = RenderExecutorTestAccess::CommitBindings(
+        context.GetRenderExecutor(), scheduler.Current(), prepared);
+    scheduler.Finish();
+    RenderExecutorTestAccess::DestroyDescriptorPipelines(
+        context.GetRenderExecutor(), std::span{&pipeline, 1u});
+  }
+
+  void CheckScalarReadBufferWriteRange() {
+    constexpr const char *name = "ScalarReadBufferWriteRange";
+    CommitScalarReadAfterBufferWrite(0x34);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    char path[MAX_PATH]{};
+    Require(name, "host", GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
+            "GetModuleFileName failed");
+    std::string command =
+        std::string("\"") + path + "\" --scalar-read-overlap-death";
+    std::vector<char> mutable_command(command.begin(), command.end());
+    mutable_command.push_back('\0');
+    STARTUPINFOA startup{sizeof(startup)};
+    PROCESS_INFORMATION process{};
+    Require(name, "host",
+            CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr,
+                           FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
+                           &process) != 0,
+            "CreateProcess failed");
+    Require(name, "host",
+            WaitForSingleObject(process.hProcess, 60000) == WAIT_OBJECT_0,
+            "overlap death case timed out");
+    DWORD exit_code = 0;
+    const bool exited = GetExitCodeProcess(process.hProcess, &exit_code) != 0;
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    Require(
+        name, "overlapping read", exited && exit_code == 321,
+        "a scalar read inside the written bytes did not report a fatal error");
+#else
+    ExpectFatal("ScalarReadBufferWriteOverlap",
+                [&] { CommitScalarReadAfterBufferWrite(0x28); });
+#endif
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckSchedulerTimeline() {
     EnsureRuntimeContext();
     CommandScheduler scheduler(Renderer(), m_runtime_context);
@@ -49918,6 +49994,18 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageStoreYzwxUsesInverseSwizzle());
     return 0;
   }
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-read-overlap-death") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CommitScalarReadAfterBufferWrite(0x28);
+    std::_Exit(0);
+  }
+#endif
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-read-range-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckScalarReadBufferWriteRange();
+    return 0;
+  }
   if (argc == 3 && std::strcmp(argv[1], "--image-view-death") == 0) {
     RunImageViewDeathCase(argv[2]);
   }
@@ -50048,6 +50136,7 @@ int main(int argc, char **argv) {
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();
+  vulkan.CheckScalarReadBufferWriteRange();
   if (rasterization) {
     vulkan.CheckGraphicsPushConstantBank();
     vulkan.CheckRenderExecutorColorDiscovery();
