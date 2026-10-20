@@ -2452,12 +2452,12 @@ int main(int argc, char** argv) {
     return 0;
   }
   TestMutexHandoff();
-  TestGetprioAfterJoin();
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
     subsystems.Destroy();
     std::printf("KernelFileSystemTests: mutex cases passed\n");
     return 0;
   }
+  TestGetprioAfterJoin();
 
   Check(SDL_InitSubSystem(SDL_INIT_VIDEO), "initialize Vulkan test video");
   auto graphics = std::make_unique<Libs::Graphics::WindowContext>();
